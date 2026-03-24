@@ -4,15 +4,17 @@ Task 1: Manual Implementation of MLP for MNIST Classification
 2-layer MLP implemented from scratch using only NumPy.
 
 Architecture:
-  Layer 1: Fully Connected (784 -> 512) + Sigmoid
-  Layer 2: Fully Connected (512 -> 10)  + Softmax
+  Layer 1: Fully Connected (784 -> 1024) + Sigmoid
+  Layer 2: Fully Connected (1024 -> 10)  + Softmax
 
 Training:
   - Batch size: 128
   - Max epochs: 30
-  - Optimizer: Momentum SGD (momentum=0.9), LR schedule starting at 1.0 * 0.95^epoch
+  - Optimizer: Nesterov Momentum SGD (momentum=0.9), LR=0.15 * 0.97^epoch
   - Loss: Cross-Entropy
   - Initialization: Xavier for sigmoid
+  - Stochastic Weight Averaging (SWA) over epochs 20-30
+  - Test-Time Augmentation (TTA) at inference
 """
 
 import numpy as np
@@ -78,7 +80,7 @@ def cross_entropy(predictions, labels):
 # MLP Class
 # ============================================================
 class MLP:
-    def __init__(self, input_size=784, hidden_size=512, output_size=10, learning_rate=1.0, momentum=0.9, weight_decay=0.0):
+    def __init__(self, input_size=784, hidden_size=512, output_size=10, learning_rate=1.0, momentum=0.9, weight_decay=0.0, label_smoothing=0.0):
         """
         Initialize the 2-layer MLP.
 
@@ -87,6 +89,7 @@ class MLP:
         self.lr = learning_rate
         self.momentum = momentum
         self.weight_decay = weight_decay
+        self.label_smoothing = label_smoothing
 
         # Layer 1: input -> hidden  (Xavier init for sigmoid)
         self.w1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / (input_size + hidden_size))
@@ -137,7 +140,7 @@ class MLP:
     # --------------------------------------------------------
     def backward(self, cache, labels):
         """
-        Backward pass: compute gradients and update parameters with momentum SGD.
+        Backward pass: compute gradients and update parameters with Nesterov momentum SGD.
 
         Parameters
         ----------
@@ -148,15 +151,19 @@ class MLP:
 
         Uses chain rule to manually derive gradients for both layers.
         Gradients are averaged over the batch.
+        Uses Nesterov momentum and label smoothing.
         """
         X = cache["X"]
         a1 = cache["a1"]
         a2 = cache["a2"]
         batch_size = X.shape[0]
+        num_classes = a2.shape[1]
 
-        # One-hot encode labels
+        # Label smoothing: replace hard one-hot with smoothed targets
+        eps = self.label_smoothing
         one_hot = np.zeros_like(a2)
         one_hot[np.arange(batch_size), labels] = 1.0
+        one_hot = one_hot * (1.0 - eps) + eps / num_classes
 
         # --- Layer 2 gradients ---
         # dL/dz2 = a2 - one_hot  (derivative of cross-entropy + softmax)
@@ -179,16 +186,22 @@ class MLP:
         dw1 += self.weight_decay * self.w1
         dw2 += self.weight_decay * self.w2
 
-        # --- Update parameters via momentum SGD ---
+        # --- Update parameters via Nesterov momentum SGD ---
+        vw1_prev = self.vw1.copy()
         self.vw1 = self.momentum * self.vw1 - self.lr * dw1
-        self.vb1 = self.momentum * self.vb1 - self.lr * db1
-        self.vw2 = self.momentum * self.vw2 - self.lr * dw2
-        self.vb2 = self.momentum * self.vb2 - self.lr * db2
+        self.w1 += -self.momentum * vw1_prev + (1 + self.momentum) * self.vw1
 
-        self.w1 += self.vw1
-        self.b1 += self.vb1
-        self.w2 += self.vw2
-        self.b2 += self.vb2
+        vb1_prev = self.vb1.copy()
+        self.vb1 = self.momentum * self.vb1 - self.lr * db1
+        self.b1 += -self.momentum * vb1_prev + (1 + self.momentum) * self.vb1
+
+        vw2_prev = self.vw2.copy()
+        self.vw2 = self.momentum * self.vw2 - self.lr * dw2
+        self.w2 += -self.momentum * vw2_prev + (1 + self.momentum) * self.vw2
+
+        vb2_prev = self.vb2.copy()
+        self.vb2 = self.momentum * self.vb2 - self.lr * db2
+        self.b2 += -self.momentum * vb2_prev + (1 + self.momentum) * self.vb2
 
     # --------------------------------------------------------
     # (3) Train Function
@@ -252,6 +265,45 @@ def evaluate(model, test_loader):
     return correct / total
 
 
+def evaluate_with_tta(model, test_loader):
+    """
+    Evaluate with Test-Time Augmentation (TTA).
+
+    Predict on 9 versions of each image (original + 8 shifts from
+    {-1,0,+1} x {-1,0,+1}), average the softmax outputs, then argmax.
+    For MLP: unflatten to 28x28, shift, re-flatten.
+    """
+    shifts = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),  (0, 0),  (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
+    correct = 0
+    total = 0
+    for images, labels in test_loader:
+        # images shape: (B, 784) for MLP — unflatten to (B, 28, 28)
+        imgs_2d = images.reshape(-1, 28, 28)
+        avg_probs = np.zeros((images.shape[0], 10))
+        for dy, dx in shifts:
+            shifted = np.roll(np.roll(imgs_2d, dx, axis=2), dy, axis=1)
+            # Zero out wrapped edges
+            if dy > 0:
+                shifted[:, :dy, :] = 0
+            elif dy < 0:
+                shifted[:, dy:, :] = 0
+            if dx > 0:
+                shifted[:, :, :dx] = 0
+            elif dx < 0:
+                shifted[:, :, dx:] = 0
+            flat = shifted.reshape(-1, 784)
+            probs, _ = model.forward(flat)
+            avg_probs += probs
+        avg_probs /= len(shifts)
+        preds = np.argmax(avg_probs, axis=1)
+        correct += np.sum(preds == labels)
+        total += len(labels)
+    return correct / total
+
+
 # ============================================================
 # (7) Main Function
 # ============================================================
@@ -262,22 +314,25 @@ def main():
     np.random.seed(42)
 
     # Hyperparameters
-    hidden_size = 784
+    hidden_size = 1024
     learning_rate = 0.15
-    lr_decay = 0.97
     momentum = 0.9
     weight_decay = 1e-4
+    label_smoothing = 0.0
     epochs = 30
     batch_size = 128
+    swa_start = 20  # Start SWA averaging from this epoch
 
     print("=" * 60)
     print("Task 1: MLP for MNIST Classification")
     print("=" * 60)
     print(f"Hidden size: {hidden_size}")
-    print(f"Learning rate: {learning_rate} (decay {lr_decay}/epoch)")
-    print(f"Momentum: {momentum}")
+    print(f"Learning rate: {learning_rate} (decay 0.97/epoch)")
+    print(f"Momentum: {momentum} (Nesterov)")
     print(f"Weight decay: {weight_decay}")
+    print(f"Label smoothing: {label_smoothing}")
     print(f"Data augmentation: random shifts (max 2px)")
+    print(f"SWA: epochs {swa_start}-{epochs}")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
     print()
@@ -291,7 +346,7 @@ def main():
     print(f"Test samples: {test_loader.n}")
     print()
 
-    # Normalize input data (zero mean, unit variance)
+    # Global normalization (zero mean, unit variance)
     train_mean = np.mean(train_loader.images)
     train_std = np.std(train_loader.images) + 1e-8
     train_loader.images = (train_loader.images - train_mean) / train_std
@@ -299,15 +354,32 @@ def main():
 
     # Initialize model
     model = MLP(input_size=784, hidden_size=hidden_size, output_size=10,
-                learning_rate=learning_rate, momentum=momentum, weight_decay=weight_decay)
+                learning_rate=learning_rate, momentum=momentum,
+                weight_decay=weight_decay, label_smoothing=label_smoothing)
 
-    # Training loop
+    # SWA: accumulate weight averages
+    swa_count = 0
+    swa_w1 = np.zeros_like(model.w1)
+    swa_b1 = np.zeros_like(model.b1)
+    swa_w2 = np.zeros_like(model.w2)
+    swa_b2 = np.zeros_like(model.b2)
+
+    # Training loop with exponential LR decay
     print("Training...")
+    lr_decay = 0.97
     for epoch in range(1, epochs + 1):
+        # Exponential decay: same schedule as baseline
+        model.lr = learning_rate * (lr_decay ** epoch)
+
         avg_loss = model.train(train_loader)
 
-        # Learning rate schedule: multiply by decay factor each epoch
-        model.lr = learning_rate * (lr_decay ** epoch)
+        # SWA: accumulate weights from epoch swa_start onward
+        if epoch >= swa_start:
+            swa_w1 += model.w1
+            swa_b1 += model.b1
+            swa_w2 += model.w2
+            swa_b2 += model.b2
+            swa_count += 1
 
         if epoch % 5 == 0 or epoch == 1:
             acc = evaluate(model, test_loader)
@@ -315,11 +387,23 @@ def main():
         else:
             print(f"Epoch {epoch:2d}/{epochs} | Loss: {avg_loss:.4f} | LR: {model.lr:.4f}")
 
+    # Apply SWA averaged weights
+    if swa_count > 0:
+        model.w1 = swa_w1 / swa_count
+        model.b1 = swa_b1 / swa_count
+        model.w2 = swa_w2 / swa_count
+        model.b2 = swa_b2 / swa_count
+        print(f"\nSWA: averaged weights from {swa_count} epochs ({swa_start}-{epochs})")
+
     # Final evaluation
     print()
     print("-" * 60)
     test_accuracy = evaluate(model, test_loader)
-    print(f"Final Test Accuracy: {test_accuracy:.4f} ({test_accuracy * 100:.2f}%)")
+    print(f"Final Test Accuracy (no TTA): {test_accuracy:.4f} ({test_accuracy * 100:.2f}%)")
+
+    # Test-Time Augmentation
+    tta_accuracy = evaluate_with_tta(model, test_loader)
+    print(f"Final Test Accuracy (with TTA): {tta_accuracy:.4f} ({tta_accuracy * 100:.2f}%)")
     print("-" * 60)
 
 

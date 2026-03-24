@@ -10,8 +10,9 @@ Architecture:
 Training:
   - Batch size: 128
   - Max epochs: 5
-  - Optimizer: Momentum SGD
+  - Optimizer: Nesterov Momentum SGD
   - Loss: Cross-Entropy
+  - Inference: Test-Time Augmentation (TTA)
 """
 
 import numpy as np
@@ -133,7 +134,7 @@ def conv2d_kernel_gradient(images, d_out, kernel_shape):
 # CNN Class
 # ============================================================
 class CNN:
-    def __init__(self, kernel_size=5, output_size=10, learning_rate=0.01, momentum=0.9, weight_decay=0.0):
+    def __init__(self, kernel_size=5, output_size=10, learning_rate=0.01, momentum=0.9, weight_decay=0.0, label_smoothing=0.0):
         """
         Initialize the 2-layer CNN.
 
@@ -144,6 +145,7 @@ class CNN:
         self.lr = learning_rate
         self.momentum = momentum
         self.weight_decay = weight_decay
+        self.label_smoothing = label_smoothing
         self.kernel_size = kernel_size
 
         # Convolution kernel: He initialization for ReLU
@@ -216,16 +218,20 @@ class CNN:
 
         Uses chain rule to manually derive gradients for both layers.
         Gradients are averaged over the batch.
+        Uses Nesterov momentum and label smoothing.
         """
         X = cache["X"]
         conv_out = cache["conv_out"]
         flat = cache["flat"]
         a_fc = cache["a_fc"]
         B = X.shape[0]
+        num_classes = a_fc.shape[1]
 
-        # One-hot encode labels
+        # Label smoothing: replace hard one-hot with smoothed targets
+        eps = self.label_smoothing
         one_hot = np.zeros_like(a_fc)
         one_hot[np.arange(B), labels] = 1.0
+        one_hot = one_hot * (1.0 - eps) + eps / num_classes
 
         # --- FC layer gradients ---
         dz_fc = (a_fc - one_hot) / B                  # (B, 10)
@@ -248,16 +254,22 @@ class CNN:
         dw_fc += self.weight_decay * self.w_fc
         d_kernel += self.weight_decay * self.kernel
 
-        # --- Update parameters via momentum SGD ---
+        # --- Update parameters via Nesterov momentum SGD ---
+        v_kernel_prev = self.v_kernel.copy()
         self.v_kernel = self.momentum * self.v_kernel - self.lr * d_kernel
-        self.v_b_conv = self.momentum * self.v_b_conv - self.lr * d_b_conv
-        self.v_w_fc = self.momentum * self.v_w_fc - self.lr * dw_fc
-        self.v_b_fc = self.momentum * self.v_b_fc - self.lr * db_fc
+        self.kernel += -self.momentum * v_kernel_prev + (1 + self.momentum) * self.v_kernel
 
-        self.kernel += self.v_kernel
-        self.b_conv += self.v_b_conv
-        self.w_fc += self.v_w_fc
-        self.b_fc += self.v_b_fc
+        v_b_conv_prev = self.v_b_conv
+        self.v_b_conv = self.momentum * self.v_b_conv - self.lr * d_b_conv
+        self.b_conv += -self.momentum * v_b_conv_prev + (1 + self.momentum) * self.v_b_conv
+
+        v_w_fc_prev = self.v_w_fc.copy()
+        self.v_w_fc = self.momentum * self.v_w_fc - self.lr * dw_fc
+        self.w_fc += -self.momentum * v_w_fc_prev + (1 + self.momentum) * self.v_w_fc
+
+        v_b_fc_prev = self.v_b_fc.copy()
+        self.v_b_fc = self.momentum * self.v_b_fc - self.lr * db_fc
+        self.b_fc += -self.momentum * v_b_fc_prev + (1 + self.momentum) * self.v_b_fc
 
     # --------------------------------------------------------
     # (3) Train Function
@@ -309,6 +321,49 @@ def evaluate(model, test_loader):
     return correct / total
 
 
+def evaluate_with_tta(model, test_loader, bg_fill=None):
+    """
+    Evaluate with Test-Time Augmentation (TTA).
+
+    Predict on 9 versions of each image (original + 8 shifts from
+    {-1,0,+1} x {-1,0,+1}), average the softmax outputs, then argmax.
+
+    Parameters
+    ----------
+    bg_fill : np.ndarray or None
+        Background fill value after shift. Shape (28, 28) for CNN.
+        If None, fills with 0.
+    """
+    shifts = [(-1, -1), (-1, 0), (-1, 1),
+              (0, -1),  (0, 0),  (0, 1),
+              (1, -1),  (1, 0),  (1, 1)]
+
+    correct = 0
+    total = 0
+    for images, labels in test_loader:
+        # images shape: (B, 28, 28) for CNN
+        avg_probs = np.zeros((images.shape[0], 10))
+        for dy, dx in shifts:
+            shifted = np.roll(np.roll(images, dx, axis=2), dy, axis=1)
+            # Fill wrapped edges with background value
+            fill = bg_fill if bg_fill is not None else np.zeros((28, 28))
+            if dy > 0:
+                shifted[:, :dy, :] = fill[:dy, :]
+            elif dy < 0:
+                shifted[:, dy:, :] = fill[dy:, :]
+            if dx > 0:
+                shifted[:, :, :dx] = fill[:, :dx]
+            elif dx < 0:
+                shifted[:, :, dx:] = fill[:, dx:]
+            probs, _ = model.forward(shifted)
+            avg_probs += probs
+        avg_probs /= len(shifts)
+        preds = np.argmax(avg_probs, axis=1)
+        correct += np.sum(preds == labels)
+        total += len(labels)
+    return correct / total
+
+
 # ============================================================
 # (7) Main Function
 # ============================================================
@@ -320,9 +375,10 @@ def main():
 
     # Hyperparameters
     kernel_size = 5
-    learning_rate = 0.01
+    learning_rate = 0.02
     momentum = 0.9
-    weight_decay = 1e-4
+    weight_decay = 0.0
+    label_smoothing = 0.0
     epochs = 5
     batch_size = 128
 
@@ -330,10 +386,12 @@ def main():
     print("Task 2: CNN for MNIST Classification")
     print("=" * 60)
     print(f"Kernel size: {kernel_size}x{kernel_size}")
-    print(f"Learning rate: {learning_rate}")
-    print(f"Momentum: {momentum}")
+    print(f"Learning rate: {learning_rate} (constant)")
+    print(f"Momentum: {momentum} (Nesterov)")
     print(f"Weight decay: {weight_decay}")
-    print(f"Data augmentation: disabled (too few epochs)")
+    print(f"Label smoothing: {label_smoothing}")
+    print(f"Data augmentation: disabled")
+    print(f"Test-Time Augmentation (TTA): 9 shifts")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
     print()
@@ -348,30 +406,39 @@ def main():
     print(f"Test samples: {test_loader.n}")
     print()
 
-    # Normalize input data (zero mean, unit variance) for better gradient flow
+    # Global normalization (zero mean, unit variance)
     train_mean = np.mean(train_loader.images)
     train_std = np.std(train_loader.images) + 1e-8
     train_loader.images = (train_loader.images - train_mean) / train_std
     test_loader.images = (test_loader.images - train_mean) / train_std
 
+    # Precompute normalized background for TTA zero-fill
+    normalized_bg = np.full((28, 28), (0.0 - train_mean) / train_std)
+
     # Initialize model
-    model = CNN(kernel_size=kernel_size, output_size=10, learning_rate=learning_rate, momentum=momentum, weight_decay=weight_decay)
+    model = CNN(kernel_size=kernel_size, output_size=10, learning_rate=learning_rate,
+                momentum=momentum, weight_decay=weight_decay, label_smoothing=label_smoothing)
     print(f"Conv output size: {28 - kernel_size + 1}x{28 - kernel_size + 1}")
     print(f"FC input size: {model.fc_input_size}")
     print()
 
-    # Training loop
+    # Training loop (constant LR)
     print("Training...")
     for epoch in range(1, epochs + 1):
+
         avg_loss = model.train(train_loader)
         acc = evaluate(model, test_loader)
-        print(f"Epoch {epoch}/{epochs} | Loss: {avg_loss:.4f} | Test Accuracy: {acc:.4f}")
+        print(f"Epoch {epoch}/{epochs} | Loss: {avg_loss:.4f} | LR: {model.lr:.4f} | Test Accuracy: {acc:.4f}")
 
     # Final evaluation
     print()
     print("-" * 60)
     test_accuracy = evaluate(model, test_loader)
-    print(f"Final Test Accuracy: {test_accuracy:.4f} ({test_accuracy * 100:.2f}%)")
+    print(f"Final Test Accuracy (no TTA): {test_accuracy:.4f} ({test_accuracy * 100:.2f}%)")
+
+    # Test-Time Augmentation
+    tta_accuracy = evaluate_with_tta(model, test_loader, bg_fill=normalized_bg)
+    print(f"Final Test Accuracy (with TTA): {tta_accuracy:.4f} ({tta_accuracy * 100:.2f}%)")
     print("-" * 60)
 
 
