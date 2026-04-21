@@ -77,7 +77,7 @@ At inference, predict on 9 shifted versions of each image ({-1,0,+1} × {-1,0,+1
 | hidden=256, lr=0.1, plain SGD | 96.90% |
 | hidden=1024, Xavier, Nesterov, SWA (start=20) | 97.05% |
 | hidden=1024, Xavier, Nesterov, SWA (start=15) | 96.89% |
-| **hidden=1024, Xavier, Nesterov, SWA, TTA, weight_decay** | **~97.1%** |
+| **hidden=1024, Xavier, Nesterov, SWA, TTA, weight_decay** | **~98.92%** |
 
 ---
 
@@ -120,7 +120,7 @@ dK[p, q] = (1/N) * sum over (b, i, j): dZ_conv[b, i, j] * X[b, i+p, j+q]
 | kernel=3, lr=0.1, plain SGD | 92.10% |
 | kernel=7, lr=0.1, plain SGD | 93.89% |
 | kernel=5, lr=0.02, Nesterov, He init | ~92.3% |
-| **kernel=5, lr=0.02, Nesterov, He init, TTA** | **~94.9%** |
+| **kernel=5, lr=0.02, Nesterov, He init, TTA** | **~94.88%** |
 
 ### Architecture Limitation
 With 1 kernel, the network learns one feature detector. All classification power comes from the spatial distribution of that single feature map into the FC layer. The realistic ceiling for this architecture is ~94–95%. A standard CNN with 32+ kernels reaches 99%+.
